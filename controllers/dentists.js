@@ -9,23 +9,45 @@ exports.getDentists = async (req, res, next) => {
   try {
     let query;
 
-    // Copy req.query
     const reqQuery = { ...req.query };
+    const searchStart = req.query.start;
+    const searchEnd = req.query.end;
+
+    // ลบออกก่อนเพื่อไม่ให้ไปปนกับ advanced filter
+    delete reqQuery.start;
+    delete reqQuery.end;
 
     // Fields to exclude
     const removeFields = ['select', 'sort', 'page', 'limit'];
     removeFields.forEach(param => delete reqQuery[param]);
 
-    // Create query string
+    // Advanced filter ปกติ
     let queryStr = JSON.stringify(reqQuery);
     queryStr = queryStr.replace(
       /\b(gt|gte|lt|lte|in)\b/g,
       match => `$${match}`
     );
 
-    query = Dentist.find(JSON.parse(queryStr)).populate('appointments');
+    let normalFilter = JSON.parse(queryStr);
 
-    // Select fields
+    //เพิ่ม working hour filter แยกต่างหาก
+    if (searchStart && searchEnd) {
+      normalFilter['workingHours.start'] = {
+        $lte: Number(searchStart)
+      };
+      normalFilter['workingHours.end'] = {
+        $gte: Number(searchEnd)
+      };
+    }
+
+    query = Dentist.find(normalFilter);
+
+    // ถ้าไม่ได้ใช้ search นี้ → populate ตามเดิม
+    if (!searchStart || !searchEnd) {
+      query = query.populate('appointments');
+    }
+
+    // Select
     if (req.query.select) {
       const fields = req.query.select.split(',').join(' ');
       query = query.select(fields);
@@ -42,13 +64,64 @@ exports.getDentists = async (req, res, next) => {
     const limit = parseInt(req.query.limit, 10) || 25;
     const startIndex = (page - 1) * limit;
     const endIndex = page * limit;
-    const total = await Dentist.countDocuments();
+
+    const total = await Dentist.countDocuments(normalFilter);
 
     query = query.skip(startIndex).limit(limit);
 
     const dentists = await query;
 
-    // Pagination result
+    //ถ้าใช้ working hour search → สร้าง timeSlots แบบ clean
+    let finalData;
+
+    if (searchStart && searchEnd) {
+
+      finalData = await Promise.all(
+        dentists.map(async (dentist) => {
+
+          const appointments = await Appointment.find({
+            dentist: dentist._id
+        });
+
+        const bookedHours = appointments.map(appt => appt.hour);
+
+        const timeSlots = [];
+
+        for (
+          let hour = dentist.workingHours.start;
+          hour < dentist.workingHours.end;
+          hour++
+        ) {
+          timeSlots.push({
+            hour,
+            status: bookedHours.includes(hour) ? "booked" : "available"
+          });
+        }
+
+        return {
+          _id: dentist._id,
+          name: dentist.name,
+          experience: dentist.experience,
+          expertise: dentist.expertise,
+          workingHours: dentist.workingHours,
+          availability: timeSlots
+        };
+      })
+    );
+
+    }else {
+
+      // กรณีปกติ → clean appointments
+      finalData = dentists.map(d => ({
+        _id: d._id,
+        name: d.name,
+        experience: d.experience,
+        expertise: d.expertise,
+        workingHours: d.workingHours,
+        appointments: d.appointments
+      }));
+    }
+
     const pagination = {};
     if (endIndex < total) {
       pagination.next = { page: page + 1, limit };
@@ -59,15 +132,16 @@ exports.getDentists = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
-      count: dentists.length,
+      count: finalData.length,
       pagination,
-      data: dentists
+      data: finalData
     });
+
   } catch (err) {
+    console.log(err);
     res.status(400).json({ success: false });
   }
 };
-
 // ==============================
 // GET ONE DENTIST
 // GET /api/v1/dentists/:id
